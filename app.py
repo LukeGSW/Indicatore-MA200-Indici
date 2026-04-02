@@ -254,19 +254,19 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
     # ── 8. Grafico breadth % ─────────────────────────────────────────────────
     st.subheader("📊 Breadth — % costituenti sopra la 200 MA")
     fig_breadth = build_breadth_chart(breadth, threshold, ext_mult, label)
-    st.plotly_chart(fig_breadth, use_container_width=True, key=f"breadth_{index_key}")
+    st.plotly_chart(fig_breadth, width="stretch", key=f"breadth_{index_key}")
 
     # ── 9. Grafico prezzo log ─────────────────────────────────────────────────
     if not index_price.empty:
         st.subheader("📈 Prezzo indice (scala log) — colore per regime breadth")
         fig_price = build_price_chart(index_price, regime, label)
-        st.plotly_chart(fig_price, use_container_width=True, key=f"price_{index_key}")
+        st.plotly_chart(fig_price, width="stretch", key=f"price_{index_key}")
 
     # ── 10. Grafico drawdown ──────────────────────────────────────────────────
     if not drawdown.empty:
         st.subheader("📉 Drawdown dal massimo storico — colore per regime breadth")
         fig_dd = build_drawdown_chart(drawdown, regime, label)
-        st.plotly_chart(fig_dd, use_container_width=True, key=f"dd_{index_key}")
+        st.plotly_chart(fig_dd, width="stretch", key=f"dd_{index_key}")
 
     st.divider()
 
@@ -293,7 +293,7 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
 
         st.dataframe(
             df_sig[["Inizio", "Fine", "Durata", "Min breadth", "Data minimo", "Attivo"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
