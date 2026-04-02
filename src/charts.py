@@ -71,8 +71,8 @@ def _add_colored_line(
     y: pd.Series,
     regime: pd.Series,
     showlegend_map: dict,
-    row: int = 1,
-    col: int = 1,
+    row: int = None,
+    col: int = None,
     width: float = 1.4,
 ) -> None:
     """
@@ -121,6 +121,13 @@ def _add_colored_line(
         label   = REGIME_LABELS.get(r_val, r_val)
         show_lg = showlegend_map.get(r_val, True)
 
+        # row/col solo per figure make_subplots; None = figura semplice
+        trace_kwargs = {}
+        if row is not None:
+            trace_kwargs["row"] = row
+        if col is not None:
+            trace_kwargs["col"] = col
+
         fig.add_trace(
             go.Scatter(
                 x=seg_x, y=seg_y,
@@ -131,7 +138,7 @@ def _add_colored_line(
                 showlegend=show_lg,
                 hoverinfo="skip",
             ),
-            row=row, col=col,
+            **trace_kwargs,
         )
         if show_lg:
             showlegend_map[r_val] = False  # mostra solo la prima volta
