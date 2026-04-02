@@ -21,6 +21,15 @@ from src.calculations import (
     compute_signals, compute_kpis,
 )
 from src.charts import build_breadth_chart, build_price_chart, build_drawdown_chart
+from src.backtest import (
+    compute_signal_forward_returns, compute_unconditional_returns,
+    build_backtest_stats, get_return_distributions, compute_mae,
+    HORIZONS,
+)
+from src.backtest_charts import (
+    build_box_comparison, build_hit_rate_chart,
+    build_mean_bar_chart, build_mae_histogram, build_pvalue_heatmap,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -338,15 +347,244 @@ I costituenti correnti vengono applicati retroattivamente a tutto lo storico dis
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TABS — rendering dei 3 indici
+# FUNZIONE RENDERING TAB BACKTEST
 # ═══════════════════════════════════════════════════════════════════════════════
 
-tab_labels = [f"{cfg['tab_icon']} {cfg['label']}" for cfg in INDEX_CONFIG.values()]
-tabs = st.tabs(tab_labels)
+def render_backtest_tab(api_key: str) -> None:
+    """
+    Rendering della tab Backtest per tutti e 3 gli indici.
 
-for tab_obj, (index_key, cfg) in zip(tabs, INDEX_CONFIG.items()):
+    Struttura:
+      - Heatmap p-value cross-indice (visione d'insieme)
+      - Sub-tab per ogni indice con 4 grafici + tabella statistica + tabella MAE
+
+    Riutilizza i dati già in cache (breadth + prezzi) — nessuna chiamata API aggiuntiva.
+    """
+    st.markdown("""
+**Metodologia:** Event Study con Forward Return Analysis.
+Per ogni segnale (crossing breadth sotto soglia), si misurano i rendimenti dell'indice
+a **1M / 3M / 6M / 12M / 24M**. Si confrontano con la distribuzione incondizionata
+(tutti i periodi possibili) tramite **Welch t-test** e **bootstrap CI 95%** (10.000 iterazioni).
+Il **Max Adverse Excursion (MAE)** quantifica il drawdown massimo dall'entry prima del recupero.
+""")
+    st.divider()
+
+    # ── Raccolta dati per tutti gli indici ───────────────────────────────────
+    all_stats:   dict[str, pd.DataFrame] = {}
+    index_data:  dict[str, dict]         = {}
+
+    for index_key, cfg in INDEX_CONFIG.items():
+        label      = cfg["label"]
+        index_code = cfg["index_code"]
+        price_tick = cfg["price_ticker"]
+        threshold  = cfg["threshold"]
+        ext_mult   = cfg["extreme_mult"]
+
+        with st.spinner(f"Caricamento dati {label} per backtest..."):
+            try:
+                tickers = fetch_index_components(index_code, api_key)
+                closes  = fetch_all_closes(tuple(sorted(tickers)), api_key)
+                i_price = fetch_index_price(price_tick, api_key)
+            except Exception as e:
+                st.warning(f"⚠️ Dati {label} non disponibili: {e}")
+                continue
+
+        if closes.empty or i_price.empty:
+            st.warning(f"⚠️ Dati incompleti per {label}, indice saltato.")
+            continue
+
+        breadth   = compute_breadth(closes)
+        signals   = compute_signals(breadth, threshold)
+        sig_fwd   = compute_signal_forward_returns(i_price, signals, HORIZONS)
+        unc_fwd   = compute_unconditional_returns(i_price, HORIZONS)
+        stats_df  = build_backtest_stats(sig_fwd, unc_fwd, HORIZONS)
+        distrib   = get_return_distributions(sig_fwd, unc_fwd, HORIZONS)
+        mae_df    = compute_mae(i_price, signals)
+
+        all_stats[label]  = stats_df
+        index_data[label] = {
+            "cfg":      cfg,
+            "signals":  signals,
+            "sig_fwd":  sig_fwd,
+            "unc_fwd":  unc_fwd,
+            "stats":    stats_df,
+            "distrib":  distrib,
+            "mae":      mae_df,
+            "threshold": threshold,
+        }
+
+    if not index_data:
+        st.error("Nessun dato disponibile per il backtest.")
+        return
+
+    # ── Heatmap cross-indice p-value ─────────────────────────────────────────
+    st.subheader("🗺️ Mappa significatività statistica — tutti gli indici")
+    st.markdown(
+        "P-value del Welch t-test (rendimento segnale vs incondizionato) per ogni indice e orizzonte. "
+        "**Verde = statisticamente significativo a 5%.**"
+    )
+    fig_heatmap = build_pvalue_heatmap(all_stats)
+    st.plotly_chart(fig_heatmap, width="stretch", key="pvalue_heatmap")
+
+    st.divider()
+
+    # ── Sub-tab per ogni indice ───────────────────────────────────────────────
+    sub_tab_labels = [f"{INDEX_CONFIG[k]['tab_icon']} {INDEX_CONFIG[k]['label']}"
+                      for k in INDEX_CONFIG if INDEX_CONFIG[k]["label"] in index_data]
+    sub_tabs = st.tabs(sub_tab_labels)
+
+    for sub_tab, (label, data) in zip(sub_tabs, index_data.items()):
+        with sub_tab:
+            _render_single_backtest(label, data)
+
+
+def _render_single_backtest(label: str, data: dict) -> None:
+    """
+    Rendering backtest per un singolo indice all'interno della sub-tab.
+
+    Mostra:
+      1. KPI sintetici del backtest
+      2. Box plot segnale vs incondizionato
+      3. Media con CI 95%
+      4. Hit rate e outperformance rate
+      5. Distribuzione MAE
+      6. Tabella statistica completa
+      7. Tabella dettaglio segnali con forward returns
+    """
+    stats_df  = data["stats"]
+    distrib   = data["distrib"]
+    mae_df    = data["mae"]
+    sig_fwd   = data["sig_fwd"]
+    signals   = data["signals"]
+    threshold = data["threshold"]
+
+    if stats_df.empty:
+        st.warning(f"Statistiche non disponibili per {label} (segnali insufficienti).")
+        return
+
+    # ── KPI sintetici ────────────────────────────────────────────────────────
+    best_row = stats_df.loc[stats_df["Media (%)"].idxmax()]
+    n_sig    = int(stats_df["N segnali"].iloc[0])
+    n_sign   = int((stats_df["Sign. 5%"] == "✅").sum())
+    best_hr  = float(stats_df["Hit rate (%)"].max())
+    avg_mae  = float(mae_df["mae_pct"].mean()) if not mae_df.empty else float("nan")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("N° segnali storici",      str(n_sig))
+    c2.metric("Orizzonti sign. 5%",      f"{n_sign} / {len(stats_df)}")
+    c3.metric("Best media (segnale)",    f"{best_row['Media (%)']:.1f}% @ {best_row['Orizzonte']}")
+    c4.metric("Hit rate massimo",        f"{best_hr:.1f}%")
+    c5.metric("MAE medio",               f"{avg_mae:.1f}%" if not np.isnan(avg_mae) else "N/D")
+
+    st.divider()
+
+    # ── Grafici in griglia 2×2 ────────────────────────────────────────────────
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        st.markdown("##### Box plot: segnale vs incondizionato")
+        fig_box = build_box_comparison(distrib, label)
+        st.plotly_chart(fig_box, width="stretch", key=f"box_{label}")
+
+    with col_r:
+        st.markdown("##### Media rendimento + CI 95% bootstrap")
+        fig_mean = build_mean_bar_chart(stats_df, label)
+        st.plotly_chart(fig_mean, width="stretch", key=f"mean_{label}")
+
+    col_l2, col_r2 = st.columns(2)
+
+    with col_l2:
+        st.markdown("##### Hit rate e Outperformance rate")
+        fig_hr = build_hit_rate_chart(stats_df, label)
+        st.plotly_chart(fig_hr, width="stretch", key=f"hr_{label}")
+
+    with col_r2:
+        st.markdown("##### Distribuzione Max Adverse Excursion (MAE)")
+        fig_mae = build_mae_histogram(mae_df, label)
+        st.plotly_chart(fig_mae, width="stretch", key=f"mae_{label}")
+
+    st.divider()
+
+    # ── Tabella statistica completa ───────────────────────────────────────────
+    st.markdown("##### 📊 Tabella statistica completa")
+    st.markdown(
+        "Media, mediana, CI 95% bootstrap, hit rate, p-value Welch test e "
+        "t-test vs 0 per ogni orizzonte forward."
+    )
+    display_cols = [
+        "Orizzonte", "N segnali", "Media (%)", "Mediana (%)", "Std (%)",
+        "Media incond. (%)", "Hit rate (%)", "Outperf. rate (%)",
+        "CI 95% inf (%)", "CI 95% sup (%)", "p-value vs incond.", "p-value vs 0", "Sign. 5%",
+    ]
+    st.dataframe(
+        stats_df[[c for c in display_cols if c in stats_df.columns]],
+        width="stretch", hide_index=True,
+    )
+
+    # ── Tabella segnali con forward returns ───────────────────────────────────
+    st.markdown("##### 📋 Dettaglio segnali con rendimenti realizzati")
+    if not sig_fwd.empty:
+        sig_display = sig_fwd.copy()
+        sig_display["Inizio"]     = sig_display["signal_date"].dt.strftime("%d/%m/%Y")
+        sig_display["Entry eff."] = sig_display["actual_entry"].dt.strftime("%d/%m/%Y")
+        for h in HORIZONS:
+            if h in sig_display.columns:
+                sig_display[h] = sig_display[h].apply(
+                    lambda x: f"{x:+.1f}%" if pd.notna(x) else "—"
+                )
+        show_cols = ["Inizio", "Entry eff."] + [h for h in HORIZONS if h in sig_display.columns]
+        st.dataframe(sig_display[show_cols], width="stretch", hide_index=True)
+    else:
+        st.info("Nessun segnale con dati forward disponibili.")
+
+    # ── Download ──────────────────────────────────────────────────────────────
+    csv = stats_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label=f"⬇️ Scarica statistiche {label} (CSV)",
+        data=csv,
+        file_name=f"backtest_{label.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        key=f"dl_bt_{label}",
+    )
+
+    # ── Metodologia ───────────────────────────────────────────────────────────
+    with st.expander("ℹ️ Dettagli metodologici"):
+        st.markdown(f"""
+**Forward Return Analysis:** rendimento dell'indice {label} da ogni entry segnale
+a orizzonte fisso (in trading days: 1M=21, 3M=63, 6M=126, 12M=252, 24M=504).
+
+**Distribuzione incondizionata:** rendimenti su TUTTI i possibili periodi di partenza
+nell'intero storico disponibile (null distribution, implementazione vettorializzata).
+
+**Welch t-test** (varianze diseguali): H₀ = media segnale = media incondizionata.
+p-value < 0.05 → si rigetta H₀ al 5% → il segnale ha un rendimento medio significativamente diverso.
+
+**Bootstrap CI 95%:** {10_000:,} ricampionamenti con sostituzione sulla distribuzione del segnale.
+Più robusto del t-interval classico con N segnali ridotto (tipicamente 10-20 per indice).
+
+**Max Adverse Excursion:** drawdown massimo dall'entry segnale al minimo realizzato
+durante l'episodio (dalla data di crossing-down alla data di crossing-up sopra soglia {threshold:.0f}%).
+Risponde a: *"quanto peggio può andare prima del recupero?"*
+
+**Survivorship bias:** si usano i costituenti correnti su tutto lo storico (approccio standard per breadth real-time).
+        """)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABS — rendering dei 3 indici + backtest
+# ═══════════════════════════════════════════════════════════════════════════════
+
+tab_labels = [f"{cfg['tab_icon']} {cfg['label']}" for cfg in INDEX_CONFIG.values()] + ["🔬 Backtest"]
+tabs = st.tabs(tab_labels)
+*index_tabs, backtest_tab = tabs
+
+for tab_obj, (index_key, cfg) in zip(index_tabs, INDEX_CONFIG.items()):
     with tab_obj:
         render_index_tab(index_key, cfg, EODHD_API_KEY)
+
+with backtest_tab:
+    st.subheader("🔬 Backtest statistico del segnale breadth — tutti gli indici")
+    render_backtest_tab(EODHD_API_KEY)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
