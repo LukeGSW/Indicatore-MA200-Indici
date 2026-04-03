@@ -417,11 +417,10 @@ def build_pvalue_heatmap(
         zmin=0.0,
         zmax=0.5,
         colorbar=dict(
-            title="p-value",
+            title=dict(text="p-value", font=dict(color=COLORS["text"])),
             tickvals=[0.0, 0.05, 0.10, 0.20, 0.50],
             ticktext=["0", "0.05*", "0.10", "0.20", "0.50"],
             tickfont=dict(color=COLORS["text"]),
-            titlefont=dict(color=COLORS["text"]),
         ),
         hovertemplate="<b>%{y} — %{x}</b><br>p-value: %{text}<extra></extra>",
     ))
