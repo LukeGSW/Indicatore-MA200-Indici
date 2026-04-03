@@ -1,11 +1,13 @@
 """
 backtest_charts.py — Grafici Plotly per la tab backtest.
 
-Quattro grafici per ogni indice:
-  1. build_box_comparison()      → Box plot segnale vs incondizionato per orizzonte
-  2. build_hit_rate_chart()      → Hit rate e outperformance rate per orizzonte
-  3. build_mean_bar_chart()      → Media segnale vs incondizionata + CI 95%
-  4. build_mae_histogram()       → Distribuzione MAE (max adverse excursion)
+Sei grafici per ogni indice:
+  1. build_box_comparison()           → Box plot segnale vs incondizionato per orizzonte
+  2. build_hit_rate_chart()           → Hit rate e outperformance rate per orizzonte
+  3. build_mean_bar_chart()           → Media segnale vs incondizionata + CI 95%
+  4. build_mae_histogram()            → Distribuzione MAE (max adverse excursion)
+  5. build_score_vs_threshold_chart() → Score composito per soglia candidata (ottimizzatore)
+  6. build_is_oos_comparison()        → Confronto IS vs OOS hit rate e edge (walk-forward)
 """
 
 import numpy as np
@@ -440,5 +442,278 @@ def build_pvalue_heatmap(
         xaxis=dict(title="Orizzonte forward", color=COLORS["text"]),
         yaxis=dict(title="Indice", color=COLORS["text"]),
     )
+
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. SCORE COMPOSITO VS SOGLIA (OTTIMIZZATORE)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_score_vs_threshold_chart(
+    scan_df: pd.DataFrame,
+    optimal_threshold: float,
+    index_label: str,
+) -> go.Figure:
+    """
+    Grafico linea dello score composito per ogni soglia candidata.
+
+    Evidenzia la soglia ottima con una linea verticale e mostra come il
+    punteggio varia al variare della soglia. Permette di valutare
+    se il massimo è stabile (plateau) o puntuale (fragile).
+
+    Args:
+        scan_df:            Output di optimizer.run_threshold_scan()
+        optimal_threshold:  Soglia con score massimo
+        index_label:        Nome indice
+
+    Returns:
+        go.Figure
+    """
+    if scan_df.empty or "composite_score" not in scan_df.columns:
+        return go.Figure()
+
+    # Ordina per soglia crescente (lo scan è sorted per score)
+    df = scan_df.sort_values("threshold").reset_index(drop=True)
+
+    thresholds = df["threshold"].tolist()
+    scores     = df["composite_score"].tolist()
+    n_signals  = df["n_signals"].tolist()
+
+    # Colora ogni punto: blu se ottimo, grigio altrimenti
+    marker_colors = [
+        COLORS["primary"] if abs(t - optimal_threshold) < 0.01 else COLORS["subtext"]
+        for t in thresholds
+    ]
+    marker_sizes = [
+        14 if abs(t - optimal_threshold) < 0.01 else 7
+        for t in thresholds
+    ]
+
+    fig = go.Figure()
+
+    # Area sotto la curva (fill)
+    fig.add_trace(go.Scatter(
+        x=thresholds,
+        y=scores,
+        mode="lines",
+        name="Score composito",
+        line=dict(color=COLORS["breadth"], width=2),
+        fill="tozeroy",
+        fillcolor="rgba(206,147,216,0.08)",
+        hovertemplate=(
+            "<b>Soglia: %{x:.1f}%</b><br>"
+            "Score: %{y:.1f}<br>"
+            "<extra></extra>"
+        ),
+    ))
+
+    # Punti con dimensione e colore variabili
+    fig.add_trace(go.Scatter(
+        x=thresholds,
+        y=scores,
+        mode="markers",
+        name="Candidati",
+        marker=dict(
+            color=marker_colors,
+            size=marker_sizes,
+            line=dict(color=COLORS["grid"], width=1),
+        ),
+        text=[f"N segnali: {n}" for n in n_signals],
+        hovertemplate=(
+            "<b>Soglia: %{x:.1f}%</b><br>"
+            "Score: %{y:.1f}<br>"
+            "%{text}<br>"
+            "<extra></extra>"
+        ),
+        showlegend=False,
+    ))
+
+    # Linea verticale alla soglia ottima
+    fig.add_vline(
+        x=optimal_threshold,
+        line_dash="dash",
+        line_color=COLORS["primary"],
+        line_width=1.8,
+        annotation_text=f"Ottima: {optimal_threshold:.1f}%",
+        annotation_position="top right",
+        annotation_font=dict(color=COLORS["primary"], size=11, family="Inter, Arial"),
+    )
+
+    layout = _base_layout(
+        title=f"Score composito per soglia breadth — {index_label}",
+        height=340,
+    )
+    layout["xaxis"].update(title="Soglia breadth (%)", ticksuffix="%")
+    layout["yaxis"].update(title="Score composito [0-100]", range=[0, 105])
+    layout["hovermode"] = "x unified"
+    fig.update_layout(**layout)
+
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. CONFRONTO IS vs OOS (WALK-FORWARD VALIDATION)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_is_oos_comparison(
+    wf_result: dict,
+    index_label: str,
+) -> go.Figure:
+    """
+    Grafico a barre doppie IS vs OOS per hit rate e edge a ogni orizzonte.
+
+    Permette di valutare se la soglia ottimizzata è robusta out-of-sample
+    o se soffre di overfitting alla storia passata.
+
+    Args:
+        wf_result:   Output di optimizer.run_walk_forward()
+        index_label: Nome indice
+
+    Returns:
+        go.Figure con 2 sub-panel: hit rate (sx) e edge (dx)
+    """
+    is_stats  = wf_result.get("is_stats",  pd.DataFrame())
+    oos_stats = wf_result.get("oos_stats", pd.DataFrame())
+    n_is      = wf_result.get("n_is",  0)
+    n_oos     = wf_result.get("n_oos", 0)
+    threshold = wf_result.get("threshold", float("nan"))
+
+    if is_stats.empty and oos_stats.empty:
+        return go.Figure()
+
+    from plotly.subplots import make_subplots as _make_subplots
+    fig = _make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["Hit rate IS vs OOS (%)", "Edge IS vs OOS (%)"],
+        horizontal_spacing=0.12,
+    )
+
+    def _extract(df: pd.DataFrame, col: str) -> tuple[list, list]:
+        """Estrae orizzonti e valori da stats_df."""
+        if df.empty or col not in df.columns or "Orizzonte" not in df.columns:
+            return [], []
+        return df["Orizzonte"].tolist(), df[col].tolist()
+
+    horizons_is,  hit_is  = _extract(is_stats,  "Hit rate (%)")
+    horizons_oos, hit_oos = _extract(oos_stats, "Hit rate (%)")
+
+    # Edge = Media segnale - Media incondizionata
+    def _edge(df: pd.DataFrame) -> list:
+        if df.empty:
+            return []
+        if "Media (%)" in df.columns and "Media incond. (%)" in df.columns:
+            return (df["Media (%)"] - df["Media incond. (%)"]).round(2).tolist()
+        return []
+
+    edge_is  = _edge(is_stats)
+    edge_oos = _edge(oos_stats)
+
+    # Barre hit rate
+    if horizons_is and hit_is:
+        fig.add_trace(go.Bar(
+            x=horizons_is, y=hit_is,
+            name=f"IS (N={n_is})",
+            marker_color=COLORS["primary"],
+            opacity=0.85,
+            text=[f"{v:.1f}%" for v in hit_is],
+            textposition="outside",
+            hovertemplate="IS %{x}: <b>%{y:.1f}%</b><extra></extra>",
+        ), row=1, col=1)
+
+    if horizons_oos and hit_oos:
+        fig.add_trace(go.Bar(
+            x=horizons_oos, y=hit_oos,
+            name=f"OOS (N={n_oos})",
+            marker_color=COLORS["accent"],
+            opacity=0.85,
+            text=[f"{v:.1f}%" for v in hit_oos],
+            textposition="outside",
+            hovertemplate="OOS %{x}: <b>%{y:.1f}%</b><extra></extra>",
+        ), row=1, col=1)
+
+    # Barre edge
+    if horizons_is and edge_is:
+        fig.add_trace(go.Bar(
+            x=horizons_is, y=edge_is,
+            name=f"Edge IS",
+            marker_color=COLORS["primary"],
+            opacity=0.85,
+            showlegend=False,
+            text=[f"{v:+.1f}%" for v in edge_is],
+            textposition="outside",
+            hovertemplate="Edge IS %{x}: <b>%{y:+.2f}%</b><extra></extra>",
+        ), row=1, col=2)
+
+    if horizons_oos and edge_oos:
+        fig.add_trace(go.Bar(
+            x=horizons_oos, y=edge_oos,
+            name=f"Edge OOS",
+            marker_color=COLORS["accent"],
+            opacity=0.85,
+            showlegend=False,
+            text=[f"{v:+.1f}%" for v in edge_oos],
+            textposition="outside",
+            hovertemplate="Edge OOS %{x}: <b>%{y:+.2f}%</b><extra></extra>",
+        ), row=1, col=2)
+
+    # Linea 50% hit rate e zero edge
+    fig.add_hline(y=50, line_dash="dash", line_color=COLORS["subtext"],
+                  line_width=1, row=1, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color=COLORS["subtext"],
+                  line_width=1, row=1, col=2)
+
+    # Layout globale
+    is_end  = wf_result.get("is_end")
+    oos_end = wf_result.get("oos_end")
+    date_str = ""
+    if is_end is not None and oos_end is not None:
+        date_str = (
+            f" | IS: fino a {pd.Timestamp(is_end).strftime('%m/%Y')}"
+            f" — OOS: fino a {pd.Timestamp(oos_end).strftime('%m/%Y')}"
+        )
+
+    fig.update_layout(
+        title=dict(
+            text=(
+                f"Walk-Forward IS/OOS — {index_label} (soglia {threshold:.1f}%)"
+                + date_str
+            ),
+            font=dict(size=13, color=COLORS["text"]),
+            x=0.5, xanchor="center",
+        ),
+        paper_bgcolor=COLORS["background"],
+        plot_bgcolor=COLORS["surface"],
+        font=dict(color=COLORS["text"], family="Inter, Arial, sans-serif", size=12),
+        legend=dict(
+            bgcolor="rgba(0,0,0,0)", bordercolor=COLORS["grid"],
+            orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0,
+        ),
+        barmode="group",
+        height=380,
+        margin=dict(l=60, r=20, t=80, b=50),
+    )
+
+    # Assi subplot
+    for col_idx, (y_title, y_range) in enumerate([
+        ("Hit rate (%)", [0, 115]),
+        ("Edge (%)", None),
+    ], start=1):
+        fig.update_xaxes(
+            title_text="Orizzonte", showgrid=True, gridcolor=COLORS["grid"],
+            color=COLORS["text"], row=1, col=col_idx,
+        )
+        y_kwargs = dict(
+            title_text=y_title, showgrid=True, gridcolor=COLORS["grid"],
+            color=COLORS["text"], ticksuffix="%", row=1, col=col_idx,
+        )
+        if y_range:
+            y_kwargs["range"] = y_range
+        fig.update_yaxes(**y_kwargs)
+
+    # Titoli subplot
+    for ann in fig.layout.annotations:
+        ann.font.color = COLORS["text"]
+        ann.font.size  = 12
 
     return fig
