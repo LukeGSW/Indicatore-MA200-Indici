@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-from src.config import INDEX_CONFIG, MA_PERIOD
+from src.config import INDEX_CONFIG, MA_PERIOD, COLORS
 from src.data_fetcher import fetch_index_components, fetch_all_closes, fetch_index_price
 from src.calculations import (
     compute_breadth, compute_drawdown, compute_regime,
@@ -29,6 +29,11 @@ from src.backtest import (
 from src.backtest_charts import (
     build_box_comparison, build_hit_rate_chart,
     build_mean_bar_chart, build_mae_histogram, build_pvalue_heatmap,
+    build_score_vs_threshold_chart, build_is_oos_comparison,
+)
+from src.optimizer import (
+    run_threshold_scan, run_walk_forward,
+    get_optimal_threshold, build_optimizer_summary,
 )
 
 
@@ -63,6 +68,15 @@ st.markdown("""
       margin-bottom: 10px;
   }
   .signal-badge-ok { background-color: #1B5E20; }
+  .opt-info-box {
+      background-color: #1A2744;
+      border: 1px solid #2196F3;
+      border-radius: 8px;
+      padding: 10px 16px;
+      margin-bottom: 12px;
+      font-size: 13px;
+      color: #90CAF9;
+  }
   .breadth-footer {
       text-align: center;
       color: #555577;
@@ -91,6 +105,25 @@ except Exception:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SESSION STATE — soglie ottimali (override dinamico)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if "optimal_thresholds" not in st.session_state:
+    st.session_state["optimal_thresholds"] = {}    # {index_key: float}
+
+if "optimizer_ran" not in st.session_state:
+    st.session_state["optimizer_ran"] = False
+
+
+def _get_threshold(index_key: str) -> float:
+    """Restituisce la soglia ottima (se applicata) o quella di default."""
+    opt = st.session_state["optimal_thresholds"]
+    if index_key in opt:
+        return opt[index_key]
+    return INDEX_CONFIG[index_key]["threshold"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -105,19 +138,33 @@ with st.sidebar:
 
     if st.button("🔄 Svuota cache e ricarica", use_container_width=True, type="secondary"):
         st.cache_data.clear()
+        st.session_state["optimal_thresholds"] = {}
+        st.session_state["optimizer_ran"] = False
         st.rerun()
 
     st.divider()
-    st.markdown("##### Soglie backtestrate")
+    st.markdown("##### Soglie attive")
     for key, cfg in INDEX_CONFIG.items():
-        thr = cfg["threshold"]
-        ext = thr * cfg["extreme_mult"]
+        thr_active  = _get_threshold(key)
+        thr_default = cfg["threshold"]
+        ext          = thr_active * cfg["extreme_mult"]
+        is_custom    = key in st.session_state["optimal_thresholds"]
+        label_extra  = " ✨" if is_custom else ""
         st.markdown(
-            f"**{cfg['label']}** &nbsp; "
-            f"<span style='color:#42A5F5'>{thr:.0f}%</span> | "
-            f"estrema <span style='color:#1565C0'>{ext:.1f}%</span>",
+            f"**{cfg['label']}**{label_extra} &nbsp; "
+            f"<span style='color:#42A5F5'>{thr_active:.1f}%</span>"
+            + (f" <span style='color:#9E9E9E'>(default {thr_default:.0f}%)</span>" if is_custom else "")
+            + f" | estrema <span style='color:#1565C0'>{ext:.1f}%</span>",
             unsafe_allow_html=True,
         )
+
+    if st.session_state["optimizer_ran"]:
+        st.divider()
+        if st.button("↩️ Ripristina soglie default", use_container_width=True, type="secondary"):
+            st.session_state["optimal_thresholds"] = {}
+            st.session_state["optimizer_ran"] = False
+            st.rerun()
+
     st.divider()
     st.caption(f"Apertura: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
 
@@ -134,33 +181,44 @@ la quota di costituenti che trattano al di sopra della propria media mobile a 20
 > **Come leggere:** quando la percentuale scende sotto la linea tratteggiata (soglia backtestata),
 > il mercato entra in **zona di potenziale accumulo**. Il colore **blu** indica la zona di stress estremo.
 """)
+
+# Banner se le soglie ottimali sono attive
+if st.session_state["optimizer_ran"] and st.session_state["optimal_thresholds"]:
+    thr_str = " | ".join(
+        f"{INDEX_CONFIG[k]['label']}: {v:.1f}%"
+        for k, v in st.session_state["optimal_thresholds"].items()
+    )
+    st.markdown(
+        f'<div class="opt-info-box">✨ <b>Soglie ottimali attive</b> — {thr_str}</div>',
+        unsafe_allow_html=True,
+    )
+
 st.divider()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FUNZIONE RENDERING TAB — definita prima delle tab per evitare errori
+# FUNZIONE RENDERING TAB INDICE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
     """
     Renderizza il contenuto completo di un tab indice.
 
+    Usa la soglia ottima da session_state se disponibile, altrimenti
+    la soglia di default da INDEX_CONFIG.
+
     Flusso:
       1. Fetch costituenti → fetch prezzi parallelo → fetch prezzo indice
       2. Calcolo breadth, regime, drawdown, segnali, KPI
       3. Badge stato → KPI row → 3 grafici → tabella segnali → download → metodologia
-
-    Args:
-        index_key: Chiave in INDEX_CONFIG (es. 'SP500')
-        cfg:       Dict di configurazione dell'indice
-        api_key:   Chiave EODHD
     """
     label      = cfg["label"]
     index_code = cfg["index_code"]
     price_tick = cfg["price_ticker"]
-    threshold  = cfg["threshold"]
+    threshold  = _get_threshold(index_key)          # soglia attiva (default o ottima)
     ext_mult   = cfg["extreme_mult"]
     ext_thr    = threshold * ext_mult
+    is_custom  = index_key in st.session_state["optimal_thresholds"]
 
     # ── 1. Fetch costituenti ─────────────────────────────────────────────────
     with st.spinner(f"📋 Caricamento costituenti {label}..."):
@@ -217,6 +275,14 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
 
     st.markdown(f'<span class="{badge_class}">{badge_txt}</span>', unsafe_allow_html=True)
 
+    if is_custom:
+        default_thr = cfg["threshold"]
+        st.markdown(
+            f'<span style="color:#90CAF9; font-size:12px;">✨ Soglia ottimizzata attiva: '
+            f'<b>{threshold:.1f}%</b> (default: {default_thr:.0f}%)</span>',
+            unsafe_allow_html=True,
+        )
+
     # ── 6. KPI row ───────────────────────────────────────────────────────────
     c1, c2, c3, c4, c5, c6 = st.columns(6)
 
@@ -228,7 +294,7 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
     )
     c2.metric(
         "Soglia segnale",
-        f"{threshold:.0f}%",
+        f"{threshold:.1f}%",
         delta=f"Estrema: {ext_thr:.1f}%",
         delta_color="off",
     )
@@ -282,7 +348,7 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
     # ── 11. Tabella storica segnali ───────────────────────────────────────────
     st.subheader(f"📋 Storico segnali — {label}")
     st.markdown(
-        f"Tutti gli episodi in cui la breadth è scesa sotto la soglia del **{threshold:.0f}%**."
+        f"Tutti gli episodi in cui la breadth è scesa sotto la soglia del **{threshold:.1f}%**."
     )
 
     if signals.empty:
@@ -333,12 +399,12 @@ I costituenti correnti vengono applicati retroattivamente a tutto lo storico dis
 (*survivorship bias* — approccio standard per indicatori breadth in tempo reale).
 
 **Soglie (backtestrate su tutto lo storico):**
-- Principale: **{threshold:.0f}%** → zona di potenziale accumulo
+- Principale: **{threshold:.1f}%** → zona di potenziale accumulo{'  ✨ *ottimizzata*' if is_custom else ''}
 - Estrema: **{ext_thr:.1f}%** → stress massimo (crisi 2002, 2008-09, 2020)
 
 **Regime colori (prezzo e drawdown):**
-- 🟢 Verde: breadth > {threshold:.0f}%
-- 🔴 Rosso: {ext_thr:.1f}% < breadth ≤ {threshold:.0f}%
+- 🟢 Verde: breadth > {threshold:.1f}%
+- 🔴 Rosso: {ext_thr:.1f}% < breadth ≤ {threshold:.1f}%
 - 🔵 Blu: breadth ≤ {ext_thr:.1f}%
 
 **Fonte dati:** EODHD Historical Data API (prezzi adjusted_close giornalieri).
@@ -355,6 +421,7 @@ def render_backtest_tab(api_key: str) -> None:
     Rendering della tab Backtest per tutti e 3 gli indici.
 
     Struttura:
+      - Sezione Ottimizzatore: scan soglie, score composito, walk-forward IS/OOS
       - Heatmap p-value cross-indice (visione d'insieme)
       - Sub-tab per ogni indice con 4 grafici + tabella statistica + tabella MAE
 
@@ -370,14 +437,14 @@ Il **Max Adverse Excursion (MAE)** quantifica il drawdown massimo dall'entry pri
     st.divider()
 
     # ── Raccolta dati per tutti gli indici ───────────────────────────────────
-    all_stats:   dict[str, pd.DataFrame] = {}
-    index_data:  dict[str, dict]         = {}
+    all_stats:  dict[str, pd.DataFrame] = {}
+    index_data: dict[str, dict]         = {}
 
     for index_key, cfg in INDEX_CONFIG.items():
         label      = cfg["label"]
         index_code = cfg["index_code"]
         price_tick = cfg["price_ticker"]
-        threshold  = cfg["threshold"]
+        threshold  = _get_threshold(index_key)
         ext_mult   = cfg["extreme_mult"]
 
         with st.spinner(f"Caricamento dati {label} per backtest..."):
@@ -393,23 +460,26 @@ Il **Max Adverse Excursion (MAE)** quantifica il drawdown massimo dall'entry pri
             st.warning(f"⚠️ Dati incompleti per {label}, indice saltato.")
             continue
 
-        breadth   = compute_breadth(closes)
-        signals   = compute_signals(breadth, threshold)
-        sig_fwd   = compute_signal_forward_returns(i_price, signals, HORIZONS)
-        unc_fwd   = compute_unconditional_returns(i_price, HORIZONS)
-        stats_df  = build_backtest_stats(sig_fwd, unc_fwd, HORIZONS)
-        distrib   = get_return_distributions(sig_fwd, unc_fwd, HORIZONS)
-        mae_df    = compute_mae(i_price, signals)
+        breadth  = compute_breadth(closes)
+        signals  = compute_signals(breadth, threshold)
+        sig_fwd  = compute_signal_forward_returns(i_price, signals, HORIZONS)
+        unc_fwd  = compute_unconditional_returns(i_price, HORIZONS)
+        stats_df = build_backtest_stats(sig_fwd, unc_fwd, HORIZONS)
+        distrib  = get_return_distributions(sig_fwd, unc_fwd, HORIZONS)
+        mae_df   = compute_mae(i_price, signals)
 
         all_stats[label]  = stats_df
         index_data[label] = {
-            "cfg":      cfg,
-            "signals":  signals,
-            "sig_fwd":  sig_fwd,
-            "unc_fwd":  unc_fwd,
-            "stats":    stats_df,
-            "distrib":  distrib,
-            "mae":      mae_df,
+            "index_key": index_key,
+            "cfg":       cfg,
+            "breadth":   breadth,
+            "i_price":   i_price,
+            "signals":   signals,
+            "sig_fwd":   sig_fwd,
+            "unc_fwd":   unc_fwd,
+            "stats":     stats_df,
+            "distrib":   distrib,
+            "mae":       mae_df,
             "threshold": threshold,
         }
 
@@ -417,7 +487,37 @@ Il **Max Adverse Excursion (MAE)** quantifica il drawdown massimo dall'entry pri
         st.error("Nessun dato disponibile per il backtest.")
         return
 
-    # ── Heatmap cross-indice p-value ─────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SEZIONE OTTIMIZZATORE
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    st.subheader("🎯 Ottimizzatore automatico delle soglie")
+    st.markdown("""
+L'ottimizzatore scansiona un range di soglie candidate per ogni indice e assegna un
+**punteggio composito [0-100]** su 5 criteri: hit rate 12M (25%), hit rate 24M (20%),
+edge normalizzato 12M (20%), significatività statistica (20%), qualità conteggio segnali (15%).
+
+La soglia ottima viene poi validata con **walk-forward IS/OOS (70%/30%)** per verificare
+la robustezza out-of-sample ed evitare overfitting sulla storia passata.
+""")
+
+    if st.button(
+        "🚀 Esegui ottimizzazione soglie (scan + walk-forward)",
+        type="primary",
+        use_container_width=True,
+        key="btn_run_optimizer",
+    ):
+        _run_optimizer(index_data)
+
+    if st.session_state["optimizer_ran"]:
+        _render_optimizer_results(index_data)
+
+    st.divider()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HEATMAP P-VALUE CROSS-INDICE
+    # ═══════════════════════════════════════════════════════════════════════════
+
     st.subheader("🗺️ Mappa significatività statistica — tutti gli indici")
     st.markdown(
         "P-value del Welch t-test (rendimento segnale vs incondizionato) per ogni indice e orizzonte. "
@@ -428,14 +528,190 @@ Il **Max Adverse Excursion (MAE)** quantifica il drawdown massimo dall'entry pri
 
     st.divider()
 
-    # ── Sub-tab per ogni indice ───────────────────────────────────────────────
-    sub_tab_labels = [f"{INDEX_CONFIG[k]['tab_icon']} {INDEX_CONFIG[k]['label']}"
-                      for k in INDEX_CONFIG if INDEX_CONFIG[k]["label"] in index_data]
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SUB-TAB PER OGNI INDICE
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    sub_tab_labels = [
+        f"{INDEX_CONFIG[k]['tab_icon']} {INDEX_CONFIG[k]['label']}"
+        for k in INDEX_CONFIG
+        if INDEX_CONFIG[k]["label"] in index_data
+    ]
     sub_tabs = st.tabs(sub_tab_labels)
 
     for sub_tab, (label, data) in zip(sub_tabs, index_data.items()):
         with sub_tab:
             _render_single_backtest(label, data)
+
+
+def _run_optimizer(index_data: dict) -> None:
+    """
+    Esegue la scansione delle soglie e il walk-forward per tutti gli indici
+    e salva i risultati in session_state.
+    """
+    scan_results:  dict = {}
+    wf_results:    dict = {}
+    new_thresholds: dict = {}
+
+    progress = st.progress(0.0, text="Ottimizzazione in corso...")
+
+    items = list(index_data.items())
+    n     = len(items)
+
+    for i, (label, data) in enumerate(items):
+        index_key = data["index_key"]
+        breadth   = data["breadth"]
+        i_price   = data["i_price"]
+
+        progress.progress(
+            (i / n) * 0.85,
+            text=f"Scan soglie {label} ({i+1}/{n})...",
+        )
+
+        # Scan
+        scan_df = run_threshold_scan(
+            breadth_values=tuple(breadth.values.tolist()),
+            breadth_index=tuple(breadth.index.tolist()),
+            price_values=tuple(i_price.values.tolist()),
+            price_index=tuple(i_price.index.tolist()),
+            index_key=index_key,
+        )
+        scan_results[index_key] = scan_df
+
+        if scan_df.empty:
+            continue
+
+        opt_thr = get_optimal_threshold(scan_df)
+        new_thresholds[index_key] = opt_thr
+
+        # Walk-forward
+        progress.progress(
+            (i / n) * 0.85 + 0.1,
+            text=f"Walk-forward {label}...",
+        )
+        wf = run_walk_forward(
+            breadth_values=tuple(breadth.values.tolist()),
+            breadth_index=tuple(breadth.index.tolist()),
+            price_values=tuple(i_price.values.tolist()),
+            price_index=tuple(i_price.index.tolist()),
+            optimal_threshold=opt_thr,
+        )
+        wf_results[index_key] = wf
+
+    progress.progress(1.0, text="Ottimizzazione completata ✅")
+    progress.empty()
+
+    # Salva risultati in session_state
+    st.session_state["scan_results"]  = scan_results
+    st.session_state["wf_results"]    = wf_results
+    st.session_state["opt_new_thr"]   = new_thresholds
+    st.session_state["optimizer_ran"] = True
+
+    st.success(
+        f"✅ Ottimizzazione completata per {len(scan_results)} indici. "
+        "Vedi i risultati qui sotto, poi clicca **Applica soglie ottimali** per aggiornare la dashboard."
+    )
+
+
+def _render_optimizer_results(index_data: dict) -> None:
+    """
+    Mostra i risultati dell'ottimizzazione (score, confronto IS/OOS, tabella riepilogativa)
+    e offre il pulsante per applicare le soglie ottimali.
+    """
+    scan_results  = st.session_state.get("scan_results",  {})
+    wf_results    = st.session_state.get("wf_results",    {})
+    new_thresholds = st.session_state.get("opt_new_thr",  {})
+
+    if not scan_results:
+        return
+
+    # ── Tabella riepilogativa ────────────────────────────────────────────────
+    config_thresholds = {k: cfg["threshold"] for k, cfg in INDEX_CONFIG.items()}
+    summary_df = build_optimizer_summary(scan_results, wf_results, config_thresholds)
+
+    if not summary_df.empty:
+        st.markdown("#### 📊 Riepilogo ottimizzazione — confronto default vs ottima")
+        st.dataframe(summary_df, width="stretch", hide_index=True)
+
+    # ── Pulsante applica ─────────────────────────────────────────────────────
+    col_btn, col_info = st.columns([1, 3])
+    with col_btn:
+        if st.button(
+            "✨ Applica soglie ottimali",
+            type="primary",
+            use_container_width=True,
+            key="btn_apply_thresholds",
+        ):
+            st.session_state["optimal_thresholds"] = new_thresholds.copy()
+            st.success(
+                "Soglie ottimali applicate! La dashboard si aggiornerà con le nuove soglie. "
+                "Naviga su una tab indice per vedere i grafici aggiornati."
+            )
+            st.rerun()
+
+    with col_info:
+        if new_thresholds:
+            thr_str = " | ".join(
+                f"{INDEX_CONFIG[k]['label']}: **{v:.1f}%** "
+                f"(default: {INDEX_CONFIG[k]['threshold']:.0f}%)"
+                for k, v in new_thresholds.items()
+            )
+            st.markdown(f"Soglie ottimali: {thr_str}")
+
+    st.divider()
+
+    # ── Dettaglio per indice: score + IS/OOS ────────────────────────────────
+    st.markdown("#### 🔍 Dettaglio per indice")
+
+    opt_tabs = st.tabs([
+        f"{INDEX_CONFIG[k]['tab_icon']} {INDEX_CONFIG[k]['label']}"
+        for k in scan_results
+        if not scan_results[k].empty
+    ])
+
+    valid_keys = [k for k in scan_results if not scan_results[k].empty]
+
+    for tab, index_key in zip(opt_tabs, valid_keys):
+        with tab:
+            scan_df   = scan_results[index_key]
+            wf_result = wf_results.get(index_key, {})
+            opt_thr   = new_thresholds.get(index_key, float("nan"))
+            label     = INDEX_CONFIG[index_key]["label"]
+
+            col_sc, col_wf = st.columns(2)
+
+            with col_sc:
+                fig_score = build_score_vs_threshold_chart(scan_df, opt_thr, label)
+                st.plotly_chart(fig_score, width="stretch", key=f"score_{index_key}")
+
+            with col_wf:
+                if wf_result:
+                    fig_isoos = build_is_oos_comparison(wf_result, label)
+                    st.plotly_chart(fig_isoos, width="stretch", key=f"isoos_{index_key}")
+                else:
+                    st.info("Walk-forward non disponibile per questo indice.")
+
+            # Tabella top-10 candidati
+            with st.expander(f"📋 Top-10 soglie candidate — {label}"):
+                display_cols = [
+                    c for c in [
+                        "threshold", "composite_score", "n_signals",
+                        "hit_12M", "hit_24M", "edge_12M", "sig_score",
+                    ]
+                    if c in scan_df.columns
+                ]
+                top10 = scan_df.head(10)[display_cols].copy()
+                rename_map = {
+                    "threshold":       "Soglia (%)",
+                    "composite_score": "Score",
+                    "n_signals":       "N segnali",
+                    "hit_12M":         "Hit 12M (%)",
+                    "hit_24M":         "Hit 24M (%)",
+                    "edge_12M":        "Edge 12M (%)",
+                    "sig_score":       "Sign. (%)",
+                }
+                top10.rename(columns={k: v for k, v in rename_map.items() if k in top10.columns}, inplace=True)
+                st.dataframe(top10, width="stretch", hide_index=True)
 
 
 def _render_single_backtest(label: str, data: dict) -> None:
@@ -470,11 +746,11 @@ def _render_single_backtest(label: str, data: dict) -> None:
     avg_mae  = float(mae_df["mae_pct"].mean()) if not mae_df.empty else float("nan")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("N° segnali storici",      str(n_sig))
-    c2.metric("Orizzonti sign. 5%",      f"{n_sign} / {len(stats_df)}")
-    c3.metric("Best media (segnale)",    f"{best_row['Media (%)']:.1f}% @ {best_row['Orizzonte']}")
-    c4.metric("Hit rate massimo",        f"{best_hr:.1f}%")
-    c5.metric("MAE medio",               f"{avg_mae:.1f}%" if not np.isnan(avg_mae) else "N/D")
+    c1.metric("N° segnali storici",    str(n_sig))
+    c2.metric("Orizzonti sign. 5%",    f"{n_sign} / {len(stats_df)}")
+    c3.metric("Best media (segnale)",  f"{best_row['Media (%)']:.1f}% @ {best_row['Orizzonte']}")
+    c4.metric("Hit rate massimo",      f"{best_hr:.1f}%")
+    c5.metric("MAE medio",             f"{avg_mae:.1f}%" if not np.isnan(avg_mae) else "N/D")
 
     st.divider()
 
@@ -563,7 +839,7 @@ p-value < 0.05 → si rigetta H₀ al 5% → il segnale ha un rendimento medio s
 Più robusto del t-interval classico con N segnali ridotto (tipicamente 10-20 per indice).
 
 **Max Adverse Excursion:** drawdown massimo dall'entry segnale al minimo realizzato
-durante l'episodio (dalla data di crossing-down alla data di crossing-up sopra soglia {threshold:.0f}%).
+durante l'episodio (dalla data di crossing-down alla data di crossing-up sopra soglia {threshold:.1f}%).
 Risponde a: *"quanto peggio può andare prima del recupero?"*
 
 **Survivorship bias:** si usano i costituenti correnti su tutto lo storico (approccio standard per breadth real-time).
@@ -593,7 +869,7 @@ with backtest_tab:
 
 st.markdown(
     f'<div class="breadth-footer">'
-    f"Kriterion Quant — Breadth Monitor v1.0 &nbsp;|&nbsp; "
+    f"Kriterion Quant — Breadth Monitor v2.0 &nbsp;|&nbsp; "
     f"Dati: EODHD &nbsp;|&nbsp; "
     f"Aggiornato: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
     f"</div>",
