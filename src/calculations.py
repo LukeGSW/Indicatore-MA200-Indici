@@ -18,38 +18,32 @@ from .config import MA_PERIOD
 def compute_breadth(closes: pd.DataFrame, ma_period: int = MA_PERIOD) -> pd.Series:
     """
     Calcola la percentuale giornaliera di costituenti con close > MA(ma_period).
-
-    Algoritmo:
-      1. Calcola la rolling mean a ma_period giorni per ogni colonna (ticker)
-      2. Su ogni data, conta quanti ticker hanno close > SMA e divide per
-         il totale di ticker con dati validi in quella data
-      3. Moltiplica per 100 → percentuale
-
-    Nota: i primi (ma_period - 1) giorni producono NaN per ogni ticker;
-    il calcolo è comunque corretto perché si usa il count dei valori validi.
-
-    Args:
-        closes:    DataFrame (date × ticker) con prezzi adjusted_close
-        ma_period: Periodo della media mobile (default: 200)
-
-    Returns:
-        pd.Series con index DatetimeIndex e valori percentuali [0, 100]
+    Include filtri per gestire dati API parziali e asincroni.
     """
     if closes.empty:
         return pd.Series(dtype=float)
 
-    # Calcola SMA per ogni ticker
-    sma = closes.rolling(window=ma_period, min_periods=ma_period).mean()
+    # 1. Filtro dati incompleti: calcola quanti ticker hanno un dato valido oggi
+    daily_counts = closes.notna().sum(axis=1)
+    
+    # Trova il massimo dei titoli attivi negli ultimi 10 giorni
+    recent_max = daily_counts.rolling(window=10, min_periods=1).max()
+    
+    # Mantieni solo i giorni in cui ha scambiato almeno l'80% dei titoli "normali"
+    valid_days = daily_counts >= (recent_max * 0.8)
+    closes_clean = closes.loc[valid_days].copy()
 
-    # Booleano: ogni cella è True se close > SMA e entrambi sono validi
-    above = (closes > sma) & closes.notna() & sma.notna()
+    # 2. Imputazione: Forward fill per gestire gap fisiologici o ritardi di 1-2 giorni
+    closes_clean = closes_clean.ffill(limit=3)
 
-    # Conta ticker validi (con SMA calcolata) su ogni data
+    # Calcolo della Breadth
+    sma = closes_clean.rolling(window=ma_period, min_periods=ma_period).mean()
+    above = (closes_clean > sma) & closes_clean.notna() & sma.notna()
     valid_count = sma.notna().sum(axis=1)
 
-    # % = (numero True) / (ticker validi) * 100
     breadth = above.sum(axis=1) / valid_count.replace(0, np.nan) * 100
     breadth.name = "breadth_pct"
+    
     return breadth.dropna()
 
 
