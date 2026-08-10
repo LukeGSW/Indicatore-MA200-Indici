@@ -2,9 +2,15 @@
 data_fetcher.py — Fetch dati EODHD con caching e parallelismo.
 
 Funzioni principali:
-  - fetch_index_components()  : lista costituenti da {INDEX}.INDX fundamentals
+  - fetch_index_components()  : lista costituenti da fonti pubbliche gratuite
   - fetch_all_closes()        : prezzi close storici di tutti i costituenti (parallelo)
   - fetch_index_price()       : serie storica del prezzo dell'indice stesso
+
+Nota sui costituenti: la lista NON arriva più da EODHD. L'endpoint
+`fundamentals/{INDEX}.INDX` (filter=Components) richiede il piano *Fundamentals
+Data* e non è incluso nell'abbonamento in uso; il recupero è stato spostato su
+una catena di fonti pubbliche gratuite in src/constituents.py. La chiave EODHD
+resta necessaria per tutti i prezzi, titoli e indici.
 """
 
 import time
@@ -19,7 +25,9 @@ from .config import (
     HISTORY_START, MA_PERIOD, MAX_WORKERS,
     CACHE_TTL_DAY, CACHE_TTL_HOUR,
     REQUEST_TIMEOUT, MAX_RETRIES, RETRY_DELAY,
+    EODHD_ALIASES,
 )
+from .constituents import ComponentsResult, get_index_components
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -66,55 +74,34 @@ def _get(url: str, params: dict, retries: int = MAX_RETRIES) -> requests.Respons
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=CACHE_TTL_DAY, show_spinner=False)
-def fetch_index_components(index_code: str, api_key: str) -> list[str]:
+def fetch_index_components(index_key: str) -> ComponentsResult:
     """
-    Recupera la lista dei costituenti correnti di un indice da EODHD.
+    Recupera la lista dei costituenti correnti di un indice da fonti gratuite.
 
-    Usa l'endpoint fundamentals/{index_code}.INDX con filter=Components.
-    Restituisce ticker in formato EODHD (es. 'AAPL.US', 'SAP.XETRA').
+    Non richiede la chiave EODHD. Delega a src/constituents.py, che percorre una
+    catena di fonti indipendenti (ETF holdings, CSV su GitHub, Wikipedia, API
+    Nasdaq) e ripiega su uno snapshot versionato nel repo se sono tutte
+    irraggiungibili.
 
     Args:
-        index_code: Codice base dell'indice (es. 'GSPC', 'NDX', 'GDAXI')
-        api_key:    Chiave API EODHD
+        index_key: Chiave di INDEX_CONFIG ('SP500', 'NASDAQ', 'DAX')
 
     Returns:
-        Lista di ticker EODHD dei costituenti correnti
+        ComponentsResult: ticker in formato EODHD ('AAPL.US', 'SAP.XETRA'),
+        più fonte usata, data dichiarata dalla fonte ed eventuali avvisi.
+
+    Raises:
+        ComponentsError: se nessuna fonte è utilizzabile
     """
-    url = f"https://eodhd.com/api/fundamentals/{index_code}.INDX"
-    resp = _get(url, params={"api_token": api_key, "filter": "Components", "fmt": "json"})
-    raw = resp.json()
-
-    tickers = []
-    if isinstance(raw, dict):
-        for comp in raw.values():
-            if not isinstance(comp, dict):
-                continue
-            code     = comp.get("Code", "").strip()
-            exchange = comp.get("Exchange", "").strip()
-            if code and exchange:
-                tickers.append(f"{code}.{exchange}")
-
-    return sorted(set(tickers))
+    return get_index_components(index_key)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FETCH STORICO SINGOLO TITOLO
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_close_single(ticker: str, start: str, api_key: str) -> tuple[str, Optional[pd.Series]]:
-    """
-    Scarica la serie storica dei prezzi adjusted_close per un singolo ticker.
-
-    Wrapper non-cached usato internamente dal fetch parallelo.
-
-    Args:
-        ticker:  Ticker EODHD (es. 'AAPL.US')
-        start:   Data inizio YYYY-MM-DD
-        api_key: Chiave EODHD
-
-    Returns:
-        Tupla (ticker, pd.Series con index DatetimeIndex) oppure (ticker, None) su errore
-    """
+def _download_close(ticker: str, start: str, api_key: str) -> Optional[pd.Series]:
+    """Scarica adjusted_close per un ticker; None se assente o su errore."""
     url = f"https://eodhd.com/api/eod/{ticker}"
     try:
         resp = _get(url, params={
@@ -125,7 +112,7 @@ def _fetch_close_single(ticker: str, start: str, api_key: str) -> tuple[str, Opt
         })
         data = resp.json()
         if not data:
-            return ticker, None
+            return None
 
         df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"])
@@ -135,10 +122,37 @@ def _fetch_close_single(ticker: str, start: str, api_key: str) -> tuple[str, Opt
         # Preferisce adjusted_close; se assente usa close
         col = "adjusted_close" if "adjusted_close" in df.columns else "close"
         series = pd.to_numeric(df[col], errors="coerce").dropna()
-        return ticker, series if not series.empty else None
+        return series if not series.empty else None
 
     except Exception:
-        return ticker, None
+        return None
+
+
+def _fetch_close_single(ticker: str, start: str, api_key: str) -> tuple[str, Optional[pd.Series]]:
+    """
+    Scarica la serie storica dei prezzi adjusted_close per un singolo ticker.
+
+    Wrapper non-cached usato internamente dal fetch parallelo.
+
+    Se il ticker non restituisce nulla e in config è definito un alias, ritenta
+    con quello: serve a coprire lo sfasamento temporale fra le liste pubbliche di
+    costituenti e l'anagrafica EODHD quando una società cambia simbolo. La serie
+    resta comunque etichettata con il ticker originale.
+
+    Args:
+        ticker:  Ticker EODHD (es. 'AAPL.US')
+        start:   Data inizio YYYY-MM-DD
+        api_key: Chiave EODHD
+
+    Returns:
+        Tupla (ticker, pd.Series con index DatetimeIndex) oppure (ticker, None) su errore
+    """
+    series = _download_close(ticker, start, api_key)
+
+    if series is None and ticker in EODHD_ALIASES:
+        series = _download_close(EODHD_ALIASES[ticker], start, api_key)
+
+    return ticker, series
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
