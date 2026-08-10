@@ -171,6 +171,23 @@ def compute_signals(breadth: pd.Series, threshold: float) -> pd.DataFrame:
 # KPI SOMMARIO
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _empty_kpis(threshold: float) -> dict:
+    """KPI tutti a NaN, con le stesse chiavi del caso nominale."""
+    return {
+        "current_breadth": np.nan,
+        "delta_breadth":   np.nan,
+        "threshold":       threshold,
+        "is_below":        False,
+        "is_active":       False,
+        "current_price":   np.nan,
+        "ytd_return":      np.nan,
+        "avg_duration":    np.nan,
+        "last_entry":      None,
+        "pct_time_below":  np.nan,
+        "n_signals":       0,
+    }
+
+
 def compute_kpis(
     breadth: pd.Series,
     index_price: pd.Series,
@@ -179,21 +196,43 @@ def compute_kpis(
     """
     Calcola le metriche chiave per il KPI row della dashboard.
 
+    Il prezzo dell'indice è opzionale: app.py lo tratta come degradabile (se il
+    fetch fallisce prosegue con una Series vuota), quindi qui non deve mai essere
+    un prerequisito. Le metriche che dipendono dal prezzo tornano NaN e la UI le
+    mostra come "N/D".
+
     Args:
         breadth:     Serie breadth %
-        index_price: Serie prezzi indice
+        index_price: Serie prezzi indice (può essere vuota)
         threshold:   Soglia breadth
 
     Returns:
-        Dizionario con le metriche principali
+        Dizionario con le metriche principali; NaN dove il dato non è calcolabile
     """
+    if breadth.empty:
+        return _empty_kpis(threshold)
+
     current_breadth = breadth.iloc[-1]
     prev_breadth    = breadth.iloc[-2] if len(breadth) > 1 else current_breadth
     delta_breadth   = current_breadth - prev_breadth
 
-    current_price = index_price.iloc[-1] if not index_price.empty else np.nan
-    ytd_start     = index_price[index_price.index.year == index_price.index[-1].year].iloc[0]
-    ytd_return    = (current_price / ytd_start - 1) * 100 if not np.isnan(current_price) else np.nan
+    current_price = np.nan
+    ytd_return    = np.nan
+
+    if not index_price.empty:
+        current_price = index_price.iloc[-1]
+
+        # Il primo prezzo dell'anno in corso. Se l'indice ha un DatetimeIndex si
+        # filtra per anno; con un indice di altro tipo si rinuncia allo YTD
+        # invece di sollevare: una serie priva di date resta comunque usabile
+        # per il prezzo corrente.
+        year_attr = getattr(index_price.index, "year", None)
+        if year_attr is not None:
+            ytd = index_price[year_attr == index_price.index[-1].year]
+            if not ytd.empty:
+                ytd_start = ytd.iloc[0]
+                if pd.notna(current_price) and pd.notna(ytd_start) and ytd_start != 0:
+                    ytd_return = (current_price / ytd_start - 1) * 100
 
     signals = compute_signals(breadth, threshold)
     avg_duration = signals["duration_days"].dropna().mean() if not signals.empty else np.nan
