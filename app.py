@@ -132,7 +132,8 @@ with st.sidebar:
     st.markdown("**Kriterion Quant**")
     st.divider()
     st.markdown(f"**Indicatore:** % sopra **{MA_PERIOD} MA**")
-    st.markdown("**Fonte:** EODHD Historical Data")
+    st.markdown("**Prezzi:** EODHD Historical Data")
+    st.markdown("**Costituenti:** fonti pubbliche gratuite")
     st.markdown("**Cache:** 24 ore")
     st.divider()
 
@@ -197,6 +198,72 @@ st.divider()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PROVENIENZA E COPERTURA DEI COSTITUENTI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_components_provenance(components, index_key: str) -> None:
+    """
+    Dichiara da quale fonte arriva la lista dei costituenti e quanto è fresca.
+
+    I costituenti non arrivano più da EODHD ma da una catena di fonti pubbliche:
+    quale sia stata effettivamente usata cambia il grado di fiducia nel dato, ed
+    è un'informazione che deve restare visibile invece di sparire nei log.
+    """
+    as_of_txt = (
+        f" &nbsp;|&nbsp; aggiornata al **{components.as_of.strftime('%d/%m/%Y')}**"
+        if components.as_of else ""
+    )
+    st.caption(
+        f"Costituenti correnti: **{components.count}** &nbsp;|&nbsp; "
+        f"fonte: **{components.source}**{as_of_txt}"
+    )
+
+    if components.degraded:
+        st.warning(
+            "⚠️ **Lista costituenti in modalità degradata.** La fonte primaria non è "
+            "raggiungibile o non è aggiornata: la breadth resta calcolabile, ma "
+            "potrebbe non riflettere gli ultimi ribilanciamenti dell'indice."
+        )
+
+    if components.warnings:
+        with st.expander(f"🔎 Dettaglio fonti costituenti — {index_key}"):
+            for w in components.warnings:
+                st.markdown(f"- {w}")
+
+
+def render_coverage(tickers: list[str], closes: pd.DataFrame, index_key: str) -> None:
+    """
+    Mostra quanti costituenti hanno effettivamente restituito prezzi da EODHD.
+
+    È il controllo che smaschera un ticker mal convertito o non presente
+    nell'anagrafica EODHD: senza di esso il titolo sparisce dal denominatore
+    della breadth in totale silenzio, e il grafico resta plausibile.
+    """
+    missing = sorted(set(tickers) - set(closes.columns))
+    if not missing:
+        return
+
+    pct = len(missing) / len(tickers) * 100
+    msg = (
+        f"{len(missing)} costituenti su {len(tickers)} ({pct:.1f}%) non hanno "
+        f"restituito prezzi da EODHD e sono esclusi dal calcolo."
+    )
+
+    # Qualche assenza è fisiologica (IPO recenti, sospensioni). Oltre il 5% il
+    # problema è sistematico: formato ticker sbagliato o exchange non coperto.
+    (st.error if pct > 5 else st.info)(f"{'❌' if pct > 5 else 'ℹ️'} {msg}")
+
+    with st.expander(f"📄 Ticker senza prezzi — {index_key}"):
+        st.markdown(
+            "Se un titolo compare qui stabilmente, con ogni probabilità EODHD lo "
+            "espone con un simbolo diverso (rinomina recente). Aggiungilo a "
+            "`EODHD_ALIASES` in `src/config.py` nella forma "
+            "`\"TICKER.US\": \"NUOVO.US\"`."
+        )
+        st.code("\n".join(missing), language="text")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # FUNZIONE RENDERING TAB INDICE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -213,26 +280,26 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
       3. Badge stato → KPI row → 3 grafici → tabella segnali → download → metodologia
     """
     label      = cfg["label"]
-    index_code = cfg["index_code"]
     price_tick = cfg["price_ticker"]
     threshold  = _get_threshold(index_key)          # soglia attiva (default o ottima)
     ext_mult   = cfg["extreme_mult"]
     ext_thr    = threshold * ext_mult
     is_custom  = index_key in st.session_state["optimal_thresholds"]
 
-    # ── 1. Fetch costituenti ─────────────────────────────────────────────────
+    # ── 1. Fetch costituenti (fonti pubbliche gratuite, nessuna chiave) ──────
     with st.spinner(f"📋 Caricamento costituenti {label}..."):
         try:
-            tickers = fetch_index_components(index_code, api_key)
+            components = fetch_index_components(index_key)
         except Exception as e:
             st.error(f"❌ Errore fetch costituenti {label}: {e}")
             return
 
+    tickers = components.tickers
     if not tickers:
-        st.error(f"Nessun costituente trovato per {label}. Controlla il codice indice '{index_code}'.")
+        st.error(f"Nessun costituente trovato per {label}.")
         return
 
-    st.caption(f"Costituenti correnti caricati: **{len(tickers)}**")
+    render_components_provenance(components, index_key)
 
     # ── 2. Fetch prezzi storici (parallelo, cache 24h) ───────────────────────
     with st.spinner(f"📥 Download storico prezzi {label} ({len(tickers)} titoli) — prima esecuzione: ~2-3 min..."):
@@ -246,6 +313,8 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
         st.error(f"Nessun dato prezzi disponibile per i costituenti di {label}.")
         return
 
+    render_coverage(tickers, closes, index_key)
+
     # ── 3. Fetch prezzo indice ───────────────────────────────────────────────
     with st.spinner(f"📈 Caricamento prezzo {label}..."):
         try:
@@ -256,6 +325,16 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
 
     # ── 4. Calcoli ───────────────────────────────────────────────────────────
     breadth  = compute_breadth(closes)
+
+    # Serve almeno un giorno con la MA200 valida: sotto MA_PERIOD barre la breadth
+    # è vuota e ogni metrica a valle sarebbe NaN mostrata come un valore reale.
+    if breadth.empty:
+        st.error(
+            f"❌ Storico insufficiente per {label}: nessun costituente raggiunge le "
+            f"{MA_PERIOD} barre necessarie alla media mobile."
+        )
+        return
+
     drawdown = compute_drawdown(index_price) if not index_price.empty else pd.Series(dtype=float)
     regime   = compute_regime(breadth, threshold, ext_mult)
     signals  = compute_signals(breadth, threshold)
@@ -394,7 +473,9 @@ def render_index_tab(index_key: str, cfg: dict, api_key: str) -> None:
 con prezzo adjusted_close > SMA({MA_PERIOD}) e si esprime la quota percentuale sul totale
 di costituenti con SMA valida in quella data.
 
-**Costituenti:** lista corrente scaricata dall'endpoint EODHD `{index_code}.INDX` (fundamentals/Components).
+**Costituenti:** lista corrente da **{components.source}** (fonti pubbliche gratuite,
+nessuna chiave API). Ogni indice ha una catena di fonti indipendenti con fallback
+automatico e uno snapshot di emergenza incluso nel repository.
 I costituenti correnti vengono applicati retroattivamente a tutto lo storico disponibile
 (*survivorship bias* — approccio standard per indicatori breadth in tempo reale).
 
@@ -407,7 +488,7 @@ I costituenti correnti vengono applicati retroattivamente a tutto lo storico dis
 - 🔴 Rosso: {ext_thr:.1f}% < breadth ≤ {threshold:.1f}%
 - 🔵 Blu: breadth ≤ {ext_thr:.1f}%
 
-**Fonte dati:** EODHD Historical Data API (prezzi adjusted_close giornalieri).
+**Fonte prezzi:** EODHD Historical Data API (prezzi adjusted_close giornalieri).
 **Cache:** 24h. Per aggiornare: sidebar → "Svuota cache e ricarica".
         """)
 
@@ -442,15 +523,14 @@ Il **Max Adverse Excursion (MAE)** quantifica il drawdown massimo dall'entry pri
 
     for index_key, cfg in INDEX_CONFIG.items():
         label      = cfg["label"]
-        index_code = cfg["index_code"]
         price_tick = cfg["price_ticker"]
         threshold  = _get_threshold(index_key)
         ext_mult   = cfg["extreme_mult"]
 
         with st.spinner(f"Caricamento dati {label} per backtest..."):
             try:
-                tickers = fetch_index_components(index_code, api_key)
-                closes  = fetch_all_closes(tuple(sorted(tickers)), api_key)
+                components = fetch_index_components(index_key)
+                closes  = fetch_all_closes(tuple(sorted(components.tickers)), api_key)
                 i_price = fetch_index_price(price_tick, api_key)
             except Exception as e:
                 st.warning(f"⚠️ Dati {label} non disponibili: {e}")
@@ -461,6 +541,10 @@ Il **Max Adverse Excursion (MAE)** quantifica il drawdown massimo dall'entry pri
             continue
 
         breadth  = compute_breadth(closes)
+        if breadth.empty:
+            st.warning(f"⚠️ Storico insufficiente per {label}, indice escluso dal backtest.")
+            continue
+
         signals  = compute_signals(breadth, threshold)
         sig_fwd  = compute_signal_forward_returns(i_price, signals, HORIZONS)
         unc_fwd  = compute_unconditional_returns(i_price, HORIZONS)
@@ -869,8 +953,8 @@ with backtest_tab:
 
 st.markdown(
     f'<div class="breadth-footer">'
-    f"Kriterion Quant — Breadth Monitor v2.0 &nbsp;|&nbsp; "
-    f"Dati: EODHD &nbsp;|&nbsp; "
+    f"Kriterion Quant — Breadth Monitor v2.1 &nbsp;|&nbsp; "
+    f"Prezzi: EODHD &nbsp;|&nbsp; Costituenti: fonti pubbliche &nbsp;|&nbsp; "
     f"Aggiornato: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
     f"</div>",
     unsafe_allow_html=True,
